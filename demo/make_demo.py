@@ -46,10 +46,31 @@ def write_csv(path: str, events: list[dict]) -> None:
             writer.writerow([ev["event_no"], ev["count"]])
 
 
+def make_events(n: int, start_count: int = 12345, gap: int = 37) -> list[dict]:
+    """生成 n 个事件的合法事件账（小间隔，计数缓慢绕圈）。"""
+    count = start_count
+    events: list[dict] = []
+    for i in range(1, n + 1):
+        events.append({"event_no": i, "count": count})
+        count = (count + gap) % MOD
+    return events
+
+
 def main(out_dir: str) -> None:
     os.makedirs(out_dir, exist_ok=True)
     events, utc = build()
     write_csv(os.path.join(out_dir, "events.csv"), events)
+
+    # 大批事件账（200 条）：演示导入期间现用账仍可核查/补登
+    write_csv(os.path.join(out_dir, "big_events.csv"), make_events(200))
+    # 第二份账（8 条）：用于制造“导入期间另一份账生效”的换账冲突
+    write_csv(os.path.join(out_dir, "events2.csv"), make_events(8, start_count=500, gap=900))
+    # 坏行文件：计数越界，整份校验失败、连暂存都不会生成
+    with open(os.path.join(out_dir, "events_bad.csv"), "w", newline="", encoding="utf-8") as fh:
+        w = csv.writer(fh)
+        w.writerow(["事件号", "计数"])
+        w.writerow([1, 10])
+        w.writerow([2, 99999])  # 超出 0..65535
 
     # 正确锚点账（事件号 -> 纸本 UTC 毫秒），至少 3 条
     good = [(1, utc[0]), (3, utc[2]), (5, utc[4])]
@@ -83,6 +104,7 @@ def main(out_dir: str) -> None:
     print("正确锚点：", good)
     print("单错锚点：", bad)
     print("双错锚点：", bad2)
+    print("额外文件：big_events.csv(200 条) / events2.csv(8 条) / events_bad.csv(坏行)")
     print(f"已写入 {out_dir}")
 
 

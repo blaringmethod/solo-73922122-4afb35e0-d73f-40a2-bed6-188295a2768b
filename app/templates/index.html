@@ -47,12 +47,19 @@
 </header>
 <main>
   <section class="card">
-    <h2>1. 上传事件 CSV（列：事件号、计数；按事件顺序排列）</h2>
+    <h2>1. 换账：校验并暂存新事件 CSV（列：事件号、计数；按事件顺序排列）</h2>
     <div class="row">
       <input type="file" id="csvFile" accept=".csv,text/csv" style="width:auto">
-      <button class="primary" id="uploadBtn">上传并建账</button>
+      <button class="primary" id="uploadBtn">校验并暂存新账</button>
       <span id="datasetInfo" class="muted"></span>
     </div>
+    <p class="muted" style="margin:8px 0 0">
+      整份文件通过校验后才会暂存；暂存与大批量写入不影响现用账——
+      导入期间下方核查与补登照常进行。确认无误后在“待启用新账”里提交，
+      旧账与旧锚点随即退出核查；若导入期间已有别的账生效，提交会被退回。
+    </p>
+    <div id="pendingBox" style="margin-top:10px"></div>
+    <div id="versionsBox" class="muted" style="margin-top:8px"></div>
   </section>
 
   <section class="card">
@@ -169,16 +176,60 @@ function renderResult(result) {
     }));
 }
 
+function renderPending(pending) {
+  const box = $("pendingBox");
+  if (!pending || pending.length === 0) {
+    box.innerHTML = "";
+    return;
+  }
+  box.innerHTML = pending.map(p => `
+    <div class="cand">
+      <div>待启用新账 #${p.id}：<b>${p.filename}</b>，事件 ${p.event_count} 条，
+      暂存于 ${p.created_at}（基于导入开始时的现用账 #${p.expected_active_id ?? "空"}）</div>
+      <div class="row" style="margin-top:6px">
+        <button class="primary" data-commit="${p.id}">提交启用（写锁内仅切换指针）</button>
+        <button data-discard="${p.id}">放弃本次换账</button>
+      </div>
+    </div>`).join("");
+  box.querySelectorAll("button[data-commit]").forEach(btn =>
+    btn.addEventListener("click", async () => {
+      try {
+        const data = await api(`/api/imports/${btn.dataset.commit}/commit`, { method: "POST" });
+        banner("ok", data.message);
+        $("resultBox").innerHTML = '<p class="muted">新账已启用，旧锚点已退出核查，请登记新锚点后核查。</p>';
+        await refresh();
+      } catch (e) { banner("bad", e.message); await refresh(); }
+    }));
+  box.querySelectorAll("button[data-discard]").forEach(btn =>
+    btn.addEventListener("click", async () => {
+      try {
+        await api(`/api/imports/${btn.dataset.discard}`, { method: "DELETE" });
+        banner("ok", "已放弃暂存账，现用账未改动");
+        await refresh();
+      } catch (e) { banner("bad", e.message); }
+    }));
+}
+
+function renderVersions(datasets) {
+  const box = $("versionsBox");
+  if (!datasets || datasets.length === 0) { box.innerHTML = ""; return; }
+  const label = { active: "现用", staging: "暂存", retired: "已退出" };
+  box.innerHTML = "账版本：" + datasets.map(d =>
+    `#${d.id} ${d.filename}（${d.event_count} 条，${label[d.status] || d.status}）`).join("　｜　");
+}
+
 async function refresh() {
   try {
     const data = await api("/api/state");
     if (data.dataset) {
       $("datasetInfo").textContent =
-        `当前账：${data.dataset.filename}，事件 ${data.dataset.event_count} 条，建账 ${data.dataset.created_at}`;
+        `现用账 #${data.dataset.id}：${data.dataset.filename}，事件 ${data.dataset.event_count} 条，建账 ${data.dataset.created_at}`;
     } else {
       $("datasetInfo").textContent = "尚未建账";
     }
     renderAnchors(data.anchors || []);
+    renderPending(data.pending_imports || []);
+    renderVersions(data.datasets || []);
   } catch (e) { banner("bad", e.message); }
 }
 
@@ -188,10 +239,8 @@ $("uploadBtn").addEventListener("click", async () => {
   const fd = new FormData();
   fd.append("file", f);
   try {
-    const data = await api("/api/dataset", { method: "POST", body: fd });
-    renderAnchors(data.anchors);
-    $("resultBox").innerHTML = '<p class="muted">新账已建立，请登记锚点后核查。</p>';
-    banner("ok", data.message);
+    const data = await api("/api/imports/start", { method: "POST", body: fd });
+    banner("warn", data.message);
     await refresh();
   } catch (e) { banner("bad", e.message); }
 });

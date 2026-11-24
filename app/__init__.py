@@ -12,6 +12,10 @@ from .csv_loader import CsvError, parse_events_csv
 from .reconcile import MIN_ANCHORS, verify
 
 
+class RecheckConflict(RuntimeError):
+    """更正后按全量锚点复核仍不一致（业务冲突，非系统故障）。"""
+
+
 def create_app(db_path: str | None = None) -> Flask:
     app = Flask(__name__)
     app.config["DB_PATH"] = db_path or os.environ.get(
@@ -19,14 +23,28 @@ def create_app(db_path: str | None = None) -> Flask:
     )
 
     def get_db() -> sqlite3.Connection:
-        conn = dbmod.connect(app.config["DB_PATH"])
-        return conn
+        return dbmod.connect(app.config["DB_PATH"])
 
     def ok(**payload):
         return jsonify({"ok": True, **payload})
 
     def fail(message: str, status: int = 400, **extra):
         return jsonify({"ok": False, "error": message, **extra}), status
+
+    def read_upload():
+        """读取并解析上传的 CSV；成功返回 (filename, events)，失败返回 (None, 错误响应)。"""
+        upload = request.files.get("file")
+        if upload is None or upload.filename == "":
+            return None, fail("请选择 CSV 文件")
+        try:
+            text = upload.read().decode("utf-8-sig")
+            parsed = parse_events_csv(text)
+        except UnicodeDecodeError:
+            return None, fail("CSV 需为 UTF-8 编码")
+        except CsvError as exc:
+            # 坏行：在校验阶段拒绝，尚未写库，现用账与锚点原样保留
+            return None, fail(f"CSV 校验失败：{exc}")
+        return (upload.filename, parsed), None
 
     # ---------- 页面 ----------
     @app.get("/")
@@ -38,10 +56,11 @@ def create_app(db_path: str | None = None) -> Flask:
     def state():
         conn = get_db()
         try:
-            meta = dbmod.get_dataset_meta(conn)
             return ok(
-                dataset=meta,
+                dataset=dbmod.get_dataset_meta(conn),
                 anchors=dbmod.list_anchors(conn),
+                pending_imports=dbmod.list_pending_imports(conn),
+                datasets=dbmod.list_datasets(conn),
                 min_anchors=MIN_ANCHORS,
             )
         finally:
@@ -58,34 +77,95 @@ def create_app(db_path: str | None = None) -> Flask:
         finally:
             conn.close()
 
-    # ---------- 上传事件 CSV（重建账） ----------
-    @app.post("/api/dataset")
-    def upload_dataset():
-        upload = request.files.get("file")
-        if upload is None or upload.filename == "":
-            return fail("请选择 CSV 文件")
-        try:
-            text = upload.read().decode("utf-8-sig")
-            parsed = parse_events_csv(text)
-        except UnicodeDecodeError:
-            return fail("CSV 需为 UTF-8 编码")
-        except CsvError as exc:
-            return fail(f"CSV 校验失败：{exc}")
+    # ---------- 两阶段换账：阶段 1，暂存（整份校验通过后才写库，不碰现用账） ----------
+    @app.post("/api/imports/start")
+    def start_import():
+        parsed, err = read_upload()
+        if err is not None:
+            return err
+        filename, events = parsed
 
         conn = get_db()
         try:
-            meta = dbmod.replace_dataset(
-                conn, upload.filename, [ev["count"] for ev in parsed]
-            )
+            expected = dbmod.get_active_dataset_id(conn)
+            try:
+                staged = dbmod.stage_import(
+                    conn, filename, [ev["count"] for ev in events], expected
+                )
+            except sqlite3.Error as exc:
+                return fail(f"暂存写入失败，现用账与锚点保留：{exc}", 500)
             return ok(
-                dataset=meta,
-                anchors=dbmod.list_anchors(conn),
-                message="事件账已重建，旧锚点已清空",
+                import_meta=staged,
+                expected_active_id=expected,
+                message=(
+                    "新账已暂存并通过整份校验；导入期间现用账仍可核查与补登，"
+                    "确认后提交启用"
+                ),
             )
         finally:
             conn.close()
 
-    # ---------- 锚点登记（核查期间可随时补登记） ----------
+    # ---------- 阶段 2：提交启用（写锁内 O(1) 指针切换） ----------
+    @app.post("/api/imports/<int:import_id>/commit")
+    def commit_import(import_id: int):
+        conn = get_db()
+        try:
+            try:
+                dbmod.commit_import(conn, import_id)
+            except dbmod.ImportConflict as exc:
+                # 换账冲突：退回本次换账，现用账与锚点保留
+                return fail(f"换账冲突：{exc}", 409, import_id=import_id)
+            except LookupError as exc:
+                return fail(str(exc), 404)
+            except sqlite3.Error as exc:
+                return fail(f"写入失败，现用账与锚点保留：{exc}", 500)
+            return ok(
+                dataset=dbmod.get_dataset_meta(conn),
+                anchors=dbmod.list_anchors(conn),
+                pending_imports=dbmod.list_pending_imports(conn),
+                message="新账已启用，旧账与旧锚点已退出核查",
+            )
+        finally:
+            conn.close()
+
+    @app.delete("/api/imports/<int:import_id>")
+    def discard_import(import_id: int):
+        conn = get_db()
+        try:
+            removed = dbmod.discard_import(conn, import_id)
+            if not removed:
+                return fail("暂存导入不存在或已处理", 404)
+            return ok(pending_imports=dbmod.list_pending_imports(conn))
+        finally:
+            conn.close()
+
+    # ---------- 一次性换账（保留原接口：暂存 + 立即提交） ----------
+    @app.post("/api/dataset")
+    def upload_dataset():
+        parsed, err = read_upload()
+        if err is not None:
+            return err
+        filename, events = parsed
+
+        conn = get_db()
+        try:
+            try:
+                meta = dbmod.replace_dataset(
+                    conn, filename, [ev["count"] for ev in events]
+                )
+            except dbmod.ImportConflict as exc:
+                return fail(f"换账冲突：{exc}", 409)
+            except sqlite3.Error as exc:
+                return fail(f"写入失败，现用账与锚点保留：{exc}", 500)
+            return ok(
+                dataset=meta,
+                anchors=dbmod.list_anchors(conn),
+                message="事件账已重建，旧锚点随旧账退出核查",
+            )
+        finally:
+            conn.close()
+
+    # ---------- 锚点登记（导入/核查期间可随时补登记，始终落在现用账） ----------
     @app.post("/api/anchors")
     def create_anchor():
         payload = request.get_json(silent=True) or {}
@@ -124,17 +204,17 @@ def create_app(db_path: str | None = None) -> Flask:
         finally:
             conn.close()
 
-    # ---------- 核查 ----------
+    # ---------- 核查：事件与锚点取自同一只读快照（同一已提交状态） ----------
     @app.post("/api/verify")
     def run_verify():
         conn = get_db()
         try:
-            if not dbmod.has_dataset(conn):
+            snapshot = dbmod.read_snapshot(conn)
+            if snapshot is None:
                 return fail("请先上传事件 CSV")
-            records = dbmod.load_records(conn)
-            anchors = dbmod.list_anchors(conn)
+            active_id, _meta, records, anchors = snapshot
             result = verify(records, anchors)
-            return ok(result=result, anchors=anchors)
+            return ok(result=result, anchors=anchors, dataset_id=active_id)
         finally:
             conn.close()
 
@@ -152,37 +232,47 @@ def create_app(db_path: str | None = None) -> Flask:
 
         conn = get_db()
         try:
-            if not dbmod.has_dataset(conn):
+            active_id = dbmod.get_active_dataset_id(conn)
+            if active_id is None:
                 return fail("请先上传事件 CSV")
-            anchor = conn.execute(
-                "SELECT id, event_no, utc_ms FROM anchor WHERE id = ?", (anchor_id,)
-            ).fetchone()
-            if anchor is None:
-                return fail("锚点不存在或已被删除", 404)
+            anchor = dbmod.get_anchor(conn, anchor_id)
+            if anchor is None or anchor["dataset_id"] != active_id:
+                return fail("锚点不存在或已随旧账退出核查", 404)
 
-            records = dbmod.load_records(conn)
+            result = None
             try:
-                # 单事务：改写 -> 按当时全部锚点复核 -> 不一致/异常则回滚
-                with conn:
-                    dbmod.update_anchor_utc(conn, anchor_id, new_utc)
-                    anchors_now = [
-                        dict(r)
-                        for r in conn.execute(
-                            "SELECT id, event_no, utc_ms FROM anchor ORDER BY event_no"
-                        )
-                    ]
-                    result = verify(records, anchors_now)
-                    if result["status"] != "consistent":
-                        raise RuntimeError("复核未通过：新时刻无法让全账一致")
+                # 单写事务：改写 -> 按当时全部锚点复核 -> 不一致/异常则回滚。
+                # 事务内读取的事件与锚点必然是同一已提交状态。
+                conn.execute("BEGIN IMMEDIATE")
+                dbmod.update_anchor_utc(conn, anchor_id, new_utc)
+                records = dbmod.load_records(conn, active_id)
+                anchors_now = [
+                    dict(r)
+                    for r in conn.execute(
+                        "SELECT id, event_no, utc_ms FROM anchor"
+                        " WHERE dataset_id = ? ORDER BY event_no",
+                        (active_id,),
+                    )
+                ]
+                result = verify(records, anchors_now)
+                if result["status"] != "consistent":
+                    raise RecheckConflict("复核未通过：新时刻无法让全账一致")
+                conn.execute("COMMIT")
             except sqlite3.Error as exc:
+                conn.execute("ROLLBACK")
                 return fail(f"保存失败，已保留原账：{exc}", 500)
-            except RuntimeError as exc:
+            except RecheckConflict as exc:
+                conn.execute("ROLLBACK")
                 return fail(
                     f"{exc}，更正已撤销",
                     409,
                     result=result,
                     original_utc_ms=anchor["utc_ms"],
                 )
+            except Exception:
+                # 复核本身意外报错：回滚并按系统故障上报，绝不留下半提交状态
+                conn.execute("ROLLBACK")
+                raise
             return ok(
                 result=result,
                 anchors=dbmod.list_anchors(conn),

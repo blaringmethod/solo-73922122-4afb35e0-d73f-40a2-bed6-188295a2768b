@@ -16,4 +16,9 @@ RUN mkdir -p /data
 VOLUME ["/data"]
 
 EXPOSE 8000
+
+# 健康检查：slim 镜像自带 python，无需额外安装 curl
+HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=5 \
+    CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/state', timeout=2).status==200 else 1)"
+
 CMD ["python", "run.py", "--host", "0.0.0.0", "--port", "8000"]

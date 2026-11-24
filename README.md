@@ -1,6 +1,8 @@
 # 桥梁振动记录仪 · 纸本 UTC 时刻核查页
 
 桥梁巡检员用纸本 UTC 时刻核对旧振动记录仪计数、定位抄错时刻的 Flask 网页。
+支持**大批振动事件两阶段换账**：导入期间现用账照常核查、补登，整份文件通过
+校验后才启用新账，旧锚点随旧账整体退出核查。
 
 ## 业务规则与建模
 
@@ -22,16 +24,46 @@
 导入 CSV 时即为每个事件预算前缀量 `prefix_min`、`prefix_amb` 并落 SQLite。
 核查任意事件对只做两次按事件号的点查，复杂度与事件总数无关（O(锚点数)）。
 
+## 两阶段换账（多版本账）
+
+每次导入生成一个新的账版本（`dataset`），事件与锚点都带 `dataset_id`，
+现用账由单行指针表 `active_ledger` 指向：
+
+1. **校验并暂存** `POST /api/imports/start`：整份 CSV 解析、校验（沿用原有
+   计数/间隔规则）、预算前缀量后，批量写入一个 `staging` 版本。此过程不触碰
+   现用账与现用锚点；配合 SQLite **WAL**，暂存大批量写入期间，巡检员仍可用
+   现用账核查、补登。
+2. **提交启用** `POST /api/imports/<id>/commit`：在一个 `BEGIN IMMEDIATE`
+   写事务里只做状态翻转（旧账 `retired`、新账 `active`）和指针更新，
+   **不读写任何 event/anchor 行**，写锁内事件读写量恒为 O(1)，与新旧账的
+   事件条数无关。
+
+关键保证：
+
+* **同一已提交状态**：核查（`/api/verify`）在一个只读事务的快照里同时读取
+  现用账事件前缀量与全部锚点，二者必然取自同一已提交状态；即使此刻另一连接
+  提交了换账，本次核查仍看到旧快照。
+* **乐观并发冲突**：暂存时记下 `expected_active_id`。提交时若指针已变
+  （导入开始后有另一份账生效），即使两份文件**同名且条数相同**也返回 409
+  退回本次换账，现用账与锚点原样保留。
+* **失败安全**：坏行在写库前的校验阶段即被拒绝；换账冲突、写入失败都会
+  回滚，现用账与锚点不受影响。
+* **旧锚点随旧账退出**：锚点按账版本隔离，换账后新账从空锚点开始，旧锚点
+  仍随 `retired` 旧账保留在库中但不再参与核查。
+* **旧库升级**：识别 v1 库（单行 `dataset` + 无 `dataset_id` 的 `event`/
+  `anchor`），在单事务内迁移到多版本结构，旧账与旧锚点（含原锚点 id）
+  立即可用；迁移幂等，可重复打开。
+
 ## 目录
 
 ```
 app/reconcile.py     核查算法（间隔候选、前缀量、一致性、单处更正候选）
-app/csv_loader.py    CSV 解析与校验
-app/db.py            SQLite 持久化（dataset/event/anchor 三表）
-app/__init__.py      Flask 路由与事务（更正+复核同事务，失败回滚保留原账）
-app/templates/       单页前端（上传/补登记/核查/确认更正）
-demo/                演示数据生成器、事件 CSV、三套锚点账、演示脚本
-tests/               37 个单元/端到端测试
+app/csv_loader.py    CSV 解析与校验（规则未变）
+app/db.py            SQLite：多版本账、暂存/提交、指针切换、v1→v2 迁移、快照
+app/__init__.py      Flask 路由与事务（两阶段换账、快照核查、更正复核同事务）
+app/templates/       单页前端（暂存/提交/放弃、补登记、核查、确认更正）
+demo/                演示数据生成器、事件/锚点 CSV、换账演示脚本
+tests/               单元/端到端/并发测试
 Dockerfile, docker-compose.yml
 ```
 
@@ -40,7 +72,8 @@ Dockerfile, docker-compose.yml
 ```bash
 docker compose up --build
 # 浏览器打开 http://localhost:8000
-# SQLite 数据保存在命名卷 inspection-data (/data/inspection.db)
+# SQLite（含 WAL/SHM）保存在命名卷 inspection-data (/data/inspection.db)
+# 带 /api/state 健康检查；旧版库挂载后首次打开自动迁移
 ```
 
 ## 本地启动（无 Docker 时）
@@ -48,25 +81,32 @@ docker compose up --build
 ```bash
 pip install -r requirements.txt
 python run.py            # 默认 http://0.0.0.0:8000，库文件 data/inspection.db
+python run.py --port 9000
 ```
 
 ## 演示流程
 
 ```bash
-python demo/make_demo.py demo     # 生成 events.csv 与三套锚点账
+python demo/make_demo.py demo     # 生成事件账（含 200 条大批账、坏行文件）与锚点账
 bash demo/demo.sh                 # 对运行中的网页跑完整 HTTP 演示
 ```
 
-页面操作：上传 `demo/events.csv` → 照 `demo/anchors_good.csv` 登记 3 条锚点 →
-核查显示“一致”；换成 `anchors_bad_single.csv` 重建并登记 → 显示不一致及候选
-首值/末值/步长 → 用候选值“确认更正并复核”（区间外的值会被拒绝并回滚）；
-`anchors_bad_double.csv` 演示“单处更正无法对平”。核查期间可随时补登记锚点，
-确认更正始终按**当时全部锚点**重新核对。
+演示脚本依次展示：初始建账与核查 → **暂存大批新账期间继续用现用账核查、补登**
+→ 坏行文件被拒且现用账保留 → 另一份账先生效导致暂存账提交 **409 冲突退回** →
+正常暂存并提交，旧锚点随旧账退出、新账可登记新锚点。
+
+页面操作：在“换账”区选择 CSV → **校验并暂存新账**（页面列出待启用新账与
+全部账版本）→ 导入期间可继续在下方登记锚点、核查 → 确认后点
+**提交启用**（若期间账已被换走会提示冲突，可放弃本次换账）。
 
 ## 自测
 
 ```bash
-python -m unittest discover -s tests -v   # 37 tests
+python -m unittest discover -s tests -v
+# test_csv_loader / test_reconcile：原有校验与计数规则（未改动）
+# test_app：原有核查/更正/回滚端到端流程
+# test_import：两阶段换账、冲突、坏行/写失败保留现用账、v1 迁移、提交 O(1)
+# test_concurrency：5 万事件暂存期间现用账持续可核查、可补登（真实 HTTP 并发）
 ```
 
 ## 接口一览
@@ -74,9 +114,13 @@ python -m unittest discover -s tests -v   # 37 tests
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET | `/` | 核查页 |
-| GET | `/api/state` | 当前账与全部锚点 |
-| POST | `/api/dataset` | 上传 CSV 重建账（清空旧锚点，单事务） |
-| POST | `/api/anchors` | 补登记锚点（重复事件号 409，原账不动） |
+| GET | `/api/state` | 现用账、全部锚点、待启用暂存账、全部账版本 |
+| POST | `/api/imports/start` | 校验并暂存新账（不碰现用账），返回暂存 id 与 `expected_active_id` |
+| POST | `/api/imports/<id>/commit` | 提交启用：O(1) 指针切换；冲突 409、写入失败 500 均保留现用账 |
+| DELETE | `/api/imports/<id>` | 放弃暂存账（现用账不受影响） |
+| POST | `/api/dataset` | 一次性换账（暂存+立即提交，兼容旧接口；冲突时 409） |
+| GET | `/api/events` | 现用账事件（含前缀量） |
+| POST | `/api/anchors` | 向现用账补登记锚点（重复事件号 409，原账不动） |
 | DELETE | `/api/anchors/<id>` | 删除锚点 |
-| POST | `/api/verify` | 按全部锚点核查 |
+| POST | `/api/verify` | 同一只读快照内按全部锚点核查，响应带所用 `dataset_id` |
 | POST | `/api/correct` | 确认更正：改写后按当时全部锚点复核，不过即回滚 |

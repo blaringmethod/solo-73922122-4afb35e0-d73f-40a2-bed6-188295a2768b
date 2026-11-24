@@ -43,9 +43,10 @@ class AppTest(unittest.TestCase):
         self.tmp.cleanup()
 
     def upload(self, data: bytes | None = None, filename: str = "events.csv"):
+        payload = data if data is not None else self.csv_bytes
         return self.client.post(
             "/api/dataset",
-            data={"file": (io.BytesIO(data if data is not None else self.csv_bytes), filename)},
+            data={"file": (io.BytesIO(payload), filename)},
             content_type="multipart/form-data",
         )
 
@@ -195,7 +196,8 @@ class AppTest(unittest.TestCase):
 class FreshDbTest(unittest.TestCase):
     def test_operations_without_dataset(self):
         tmp = tempfile.TemporaryDirectory()
-        app = create_app(db_path=os.path.join(tmp.name, "fresh.db"))
+        db_path = os.path.join(tmp.name, "fresh.db")
+        app = create_app(db_path=db_path)
         client = app.test_client()
         self.assertEqual(client.post("/api/verify").status_code, 400)
         self.assertEqual(
